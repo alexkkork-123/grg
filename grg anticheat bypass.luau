@@ -1,8 +1,8 @@
 -- ---------------------------------------------------------------------------
 -- GRG ANTI-CHEAT BYPASS -- compiled bundle
 -- Built by: grg/anticheat/tools/compile_acbypass.py
--- Modules : 76
--- Bytes   : 524335
+-- Modules : 78
+-- Bytes   : 552612
 -- ---------------------------------------------------------------------------
 
 local __MODULES__ = {}
@@ -1314,6 +1314,214 @@ return function(require)
 end
 
 end
+__MODULES__['core/scheduler'] = function(require)
+--[[ ================================================================
+    src/core/scheduler.lua
+    -----------------------
+    Single shared Heartbeat dispatcher. All AC bypass modules that used
+    to call `RunService.Heartbeat:Connect(...)` directly now register
+    here with a target frequency. We use ONE physical connection and
+    multiplex per-task rate limits internally.
+
+    Why:
+        * On slower executors (MacSploit), each Connection dispatch
+          has per-call overhead. Going from 16 Heartbeat handlers down
+          to 1 is a measurable fps win.
+        * Per-task rates let the 60 Hz position mask coexist with 4 Hz
+          shadowban sweeps cleanly, instead of everything running at
+          full frame rate.
+
+    API:
+        scheduler.register(fn, hz, name)
+            -> returns a "connection-like" handle with :Disconnect()
+            -> hz == 0 means "every frame"
+
+        scheduler.pause_all() / resume_all()
+        scheduler.set_global_hz_cap(n)
+            -> cap the outer heartbeat dispatch to n Hz. We still
+               accept per-task rates higher than that, but the whole
+               scheduler only runs its tick() n times per second.
+
+        scheduler.stats() -> dump call counters per task
+
+    Dispatch behaviour:
+        * Tasks are dispatched in registration order.
+        * If a task errors, we log once per task and keep going.
+        * If a task's handle is :Disconnect()'d, we skip it.
+================================================================ ]]
+
+return function(require)
+
+    local env = require("core/env")
+    local log = require("core/log")
+
+    local L = log.scoped("core/scheduler")
+    local M = {}
+
+    local TASKS = {}
+    local HB_CONN = nil
+    local GLOBAL_HZ_CAP = 0        -- 0 = uncapped
+    local OUTER_ACC = 0
+    local PAUSED = false
+    local ERROR_SEEN = {}          -- dedupe error spam
+
+    -- ------------------------------------------------------------------
+    -- internal: the one and only heartbeat tick
+    -- ------------------------------------------------------------------
+
+    local function tick(dt)
+        if PAUSED then return end
+
+        if GLOBAL_HZ_CAP > 0 then
+            OUTER_ACC = OUTER_ACC + dt
+            local cap_period = 1 / GLOBAL_HZ_CAP
+            if OUTER_ACC < cap_period then return end
+            dt = OUTER_ACC
+            OUTER_ACC = 0
+        end
+
+        for i = 1, #TASKS do
+            local t = TASKS[i]
+            if t and t.enabled and not t.disconnected then
+                if t.period <= 0 then
+                    -- run every tick
+                    t.calls = t.calls + 1
+                    local ok, err = pcall(t.fn, dt)
+                    if not ok then
+                        if not ERROR_SEEN[t.name] then
+                            ERROR_SEEN[t.name] = true
+                            L:warn("task '%s' errored: %s", t.name, tostring(err))
+                        end
+                        t.errors = t.errors + 1
+                    end
+                else
+                    t.acc = t.acc + dt
+                    if t.acc >= t.period then
+                        local effective_dt = t.acc
+                        t.acc = 0
+                        t.calls = t.calls + 1
+                        local ok, err = pcall(t.fn, effective_dt)
+                        if not ok then
+                            if not ERROR_SEEN[t.name] then
+                                ERROR_SEEN[t.name] = true
+                                L:warn("task '%s' errored: %s", t.name, tostring(err))
+                            end
+                            t.errors = t.errors + 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- ------------------------------------------------------------------
+    -- lazy-start the outer heartbeat
+    -- ------------------------------------------------------------------
+
+    local function ensure_started()
+        if HB_CONN then return true end
+        if not env.RunService then
+            L:warn("RunService missing; scheduler disabled")
+            return false
+        end
+        local ok, conn = pcall(function()
+            return env.RunService.Heartbeat:Connect(tick)
+        end)
+        if not ok or not conn then
+            L:warn("failed to connect Heartbeat: %s", tostring(conn))
+            return false
+        end
+        HB_CONN = conn
+        L:info("scheduler started (cap=%d Hz)", GLOBAL_HZ_CAP)
+        return true
+    end
+
+    -- ------------------------------------------------------------------
+    -- public API
+    -- ------------------------------------------------------------------
+
+    function M.register(fn, hz, name)
+        if type(fn) ~= "function" then
+            L:warn("register: fn must be function (got %s)", type(fn))
+            return nil
+        end
+        hz = tonumber(hz) or 0
+        name = tostring(name or ("task#" .. (#TASKS + 1)))
+        local period = hz > 0 and (1 / hz) or 0
+        local task = {
+            fn           = fn,
+            hz           = hz,
+            period       = period,
+            acc          = 0,
+            enabled      = true,
+            disconnected = false,
+            calls        = 0,
+            errors       = 0,
+            name         = name,
+        }
+        table.insert(TASKS, task)
+        ensure_started()
+        -- expose a Connection-like handle so legacy CONN:Disconnect() calls keep working
+        local handle = {}
+        function handle:Disconnect()
+            task.disconnected = true
+            task.enabled = false
+        end
+        handle.Disconnected = function() return task.disconnected end
+        handle.Task = task
+        return handle
+    end
+
+    function M.pause_all()  PAUSED = true;  L:info("paused")  end
+    function M.resume_all() PAUSED = false; L:info("resumed") end
+
+    function M.set_global_hz_cap(n)
+        GLOBAL_HZ_CAP = tonumber(n) or 0
+        OUTER_ACC = 0
+        L:info("global hz cap set to %d", GLOBAL_HZ_CAP)
+    end
+
+    function M.stats()
+        local out = {}
+        for i, t in ipairs(TASKS) do
+            out[i] = {
+                name         = t.name,
+                hz           = t.hz,
+                calls        = t.calls,
+                errors       = t.errors,
+                enabled      = t.enabled,
+                disconnected = t.disconnected,
+            }
+        end
+        return out
+    end
+
+    function M.dump_stats_str()
+        local lines = { "scheduler tasks:" }
+        for i, t in ipairs(TASKS) do
+            lines[#lines + 1] = string.format(
+                "  #%-2d  %-40s  hz=%-5s  calls=%-8d  errs=%-3d  %s",
+                i, t.name, tostring(t.hz), t.calls, t.errors,
+                t.disconnected and "(disconnected)"
+                    or (t.enabled and "(on)" or "(off)")
+            )
+        end
+        return table.concat(lines, "\n")
+    end
+
+    function M.install()
+        ensure_started()
+        L:info("scheduler online (tasks=%d)", #TASKS)
+    end
+
+    -- expose globally so the main hub can optionally read stats
+    rawset(_G, "GRG_AC_SCHED", M)
+
+    return M
+
+end
+
+end
 __MODULES__['core/signal'] = function(require)
 --[[ ================================================================
     src/core/signal.lua
@@ -1732,6 +1940,7 @@ return function(require)
     local log    = require("core/log")
     local cfg    = require("core/config")
     local state  = require("core/state")
+    local sched  = require("core/scheduler")
 
     local M = {}
     local L = log.scoped("decoys/globals")
@@ -1870,18 +2079,8 @@ return function(require)
 
     local function start_heartbeat()
         if TICK_CONN then return end
-        if not env.RunService then
-            L:warn("no RunService available; __AC_LAST_CHECK will not refresh")
-            return
-        end
-        local last = tick()
-        TICK_CONN = env.RunService.Heartbeat:Connect(function()
+        TICK_CONN = sched.register(function()
             local now = tick()
-            if now - last < 0.5 then return end
-            last = now
-            -- Only refresh if our global is still present; if someone
-            -- removed it, don't re-add it -- that would fight external
-            -- intent and could look suspicious.
             if rawget(_G, "__AC_LAST_CHECK") ~= nil then
                 rawset(_G, "__AC_LAST_CHECK", now)
             end
@@ -1889,7 +2088,7 @@ return function(require)
             if type(ac) == "table" and type(ac.checks) == "number" then
                 ac.checks = ac.checks + 1
             end
-        end)
+        end, 2, "decoys/globals")
     end
 
     local function stop_heartbeat()
@@ -2213,6 +2412,7 @@ return function(require)
     local log    = require("core/log")
     local cfg    = require("core/config")
     local state  = require("core/state")
+    local sched  = require("core/scheduler")
 
     local M = {}
     local L = log.scoped("decoys/position")
@@ -2356,17 +2556,12 @@ return function(require)
 
         RUNNING = true
 
-        -- We do the position sample and the fire on the same
-        -- Heartbeat signal, but they gate themselves independently:
-        -- sampler runs every tick to keep LAST_SAFE smooth, fire
-        -- runs at the config-selected cadence.
-        TICK_CONN = env.RunService.Heartbeat:Connect(function()
+        -- 20 Hz is plenty for position smoothing; scheduler_tick's
+        -- send_once() gates internally on cadence_hz (default 4).
+        TICK_CONN = sched.register(function()
             LAST_TICK_T = tick()
-            local ok, err = pcall(scheduler_tick)
-            if not ok then
-                L:warn("scheduler tick errored: %s", tostring(err))
-            end
-        end)
+            scheduler_tick()
+        end, 20, "decoys/position")
 
         L:info("decoy position active (cadence=%d Hz, tolerance=%.2f)",
             cfg:get("decoys.position.cadence_hz", 4),
@@ -3229,6 +3424,7 @@ return function(require)
     local log   = require("core/log")
     local cfg   = require("core/config")
     local state = require("core/state")
+    local sched = require("core/scheduler")
     local recv  = require("hooks/recv_handlers")
     local namecall = require("hooks/namecall")
     local gate  = require("grg/placeid_gate")
@@ -3377,15 +3573,9 @@ return function(require)
             end,
         })
 
-        -- Heartbeat watcher for silent-ragdoll health snaps.
-        if env.RunService then
-            env.RunService.Heartbeat:Connect(function(dt)
-                local ok, err = pcall(silent_ragdoll_watch, dt)
-                if not ok then
-                    L:warn("silent watch errored: %s", tostring(err))
-                end
-            end)
-        end
+        -- Silent-ragdoll health snaps. 10 Hz is enough since the AC
+        -- fires RagdollEvent via a RemoteEvent, not a tight polling loop.
+        sched.register(silent_ragdoll_watch, 10, "grg/ragdoll_handler")
 
         -- Reset health tracking whenever the character respawns.
         if env.LocalPlayer then
@@ -3881,6 +4071,657 @@ return function(require)
             local fname = FILE_PREFIX .. job_tag() .. ".txt"
             pcall(delfile, fname)
         end
+    end
+
+    return M
+
+end
+
+end
+__MODULES__['grg/speed_bypass'] = function(require)
+--[[ ================================================================
+    src/grg/speed_bypass.lua
+    -------------------------
+    GRG-specific speed-detection bypass. Bundled with the AC bypass so
+    it loads before the main hub, which means the telemetry clamp and
+    suspicion-point resetter are active from the first frame and protect
+    ALL subsequent speed actions from the hub (or from any other cheat
+    the user runs).
+
+    Intel (recon 2026-04):
+      * GRG stores `SuspicionPoints` (number) + `IsSuspicious` (bool)
+        on every Player as Attributes. Points accumulate; at threshold
+        CollisionGroup flips to "ShadowBan".
+      * `CharPos` Attribute tracks server-side position.
+      * `IsDriving=true` correlates with walk-speed-check suppression.
+      * Shadowban + Ragdoll fire via ReplicatedStorage.Remotes.
+      * UpdateProfile payloads carry speed/position telemetry.
+
+    Layers implemented here:
+      A. telemetry_clamp     -- intercept FireServer / InvokeServer on
+                                UpdateProfile-style remotes and clamp
+                                any Vector3/number that looks like a
+                                velocity or displacement.
+      B. suspicion_reset     -- 4 Hz loop; SetAttribute SuspicionPoints
+                                = 0, IsSuspicious = false on LocalPlayer.
+      C. ischar_pos_scrub    -- strip CharPos-style keys out of outgoing
+                                telemetry so the server isn't handed
+                                our real displacement.
+      D. warning_auto_off    -- if ShadowBanEvent / RagdollEvent fires
+                                on us, flip off any "techniques" that
+                                may be active by writing
+                                _G.GRG_SB_CFG.enabled = false.
+
+    Movement mechanism techniques (seat_clone, platform_stand,
+    velocity_step, state_swap, cframe_pulse) stay here too so the whole
+    "speed bypass" concept lives in the AC bundle. They are idle
+    (conf-gated) until the hub calls into _G.GRG_SB.
+
+    External API (`_G.GRG_SB`):
+        :set(on)                  -- master enable/disable
+        :set_technique(key, on)   -- toggle one technique
+        :configure(key, value)    -- set a numeric/scalar config
+        :get(key)                 -- read config
+        :status()                 -- diagnostics table
+        :diagnostics()            -- pretty-printed status string
+================================================================ ]]
+
+return function(require)
+
+    local env   = require("core/env")
+    local log   = require("core/log")
+    local cfg   = require("core/config")
+    local state = require("core/state")
+    local sched = require("core/scheduler")
+
+    -- Some recv/namecall helpers may be present depending on the bundle
+    -- loading order. We don't hard-require them; if missing, we install
+    -- our own hookmetamethod fallback.
+    local ok_recv, recv         = pcall(require, "hooks/recv_handlers")
+    local ok_namecall, namecall = pcall(require, "hooks/namecall")
+
+    local M = {}
+    local L = log.scoped("grg/speed_bypass")
+
+    --------------------------------------------------------------------
+    -- Config store. We keep a plain mutable table exposed via
+    -- _G.GRG_SB_CFG so the main hub can poke at it without needing the
+    -- AC bypass cfg system.
+    --------------------------------------------------------------------
+
+    local CFG = {
+        enabled             = false,
+
+        -- protection layers (always active when enabled, regardless of
+        -- technique selection)
+        telemetry_clamp     = true,
+        suspicion_reset     = true,
+        charpos_scrub       = true,
+        warning_auto_off    = true,
+
+        -- movement techniques
+        seat_clone          = false,
+        platform_stand      = false,
+        state_swap          = false,
+        velocity_step       = true,
+        cframe_pulse        = false,
+
+        -- knobs
+        walkspeed           = 28,
+        clamp_max_speed     = 18,
+        suspicion_reset_hz  = 4,
+        pulse_fast_speed    = 40,
+        pulse_slow_speed    = 16,
+        pulse_fast_seconds  = 0.15,
+        pulse_slow_seconds  = 0.35,
+    }
+
+    -- Merge any CFG overrides already set by an earlier load
+    local existing = rawget(_G, "GRG_SB_CFG")
+    if type(existing) == "table" then
+        for k, v in pairs(existing) do CFG[k] = v end
+    end
+    rawset(_G, "GRG_SB_CFG", CFG)
+
+    local STATS = {
+        ticks                 = 0,
+        telemetry_blocked     = 0,
+        suspicion_resets      = 0,
+        charpos_scrubs        = 0,
+        warning_auto_offs     = 0,
+        seats_spawned         = 0,
+        velocity_steps        = 0,
+    }
+
+    local function conf(k) return CFG[k] end
+
+    --------------------------------------------------------------------
+    -- Helpers
+    --------------------------------------------------------------------
+
+    local function lp() return env.LocalPlayer end
+    local function char()
+        return lp() and lp().Character
+    end
+    local function root()
+        local c = char()
+        return c and c:FindFirstChild("HumanoidRootPart")
+    end
+    local function hum()
+        local c = char()
+        return c and c:FindFirstChildOfClass("Humanoid")
+    end
+
+    local function move_dir()
+        local h = hum()
+        if not h then return Vector3.new(0, 0, 0) end
+        local d = h.MoveDirection
+        if d.Magnitude < 0.05 then return Vector3.new(0, 0, 0) end
+        return d
+    end
+
+    local function safe(fn, ...)
+        local ok, err = pcall(fn, ...)
+        if not ok then L:warn("safe: %s", tostring(err)) end
+        return ok
+    end
+
+    --------------------------------------------------------------------
+    -- A. telemetry_clamp
+    --
+    -- Names from recon that typically carry movement/profile payloads.
+    --------------------------------------------------------------------
+
+    local SUSPECT_REMOTE_NAMES = {
+        "UpdateProfile", "SuspicionReport", "ReplicateSpeed",
+        "ReportMovement", "PlayerUpdate", "CharacterUpdate",
+        "UpdateCharPos", "CharPos", "ProfileUpdate",
+        "SubmitPosition", "PostMovement", "NetworkedReplicate",
+    }
+
+    local function name_matches(n)
+        if type(n) ~= "string" then return false end
+        local lowered = string.lower(n)
+        for _, pat in ipairs(SUSPECT_REMOTE_NAMES) do
+            if string.find(lowered, string.lower(pat), 1, true) then
+                return true
+            end
+        end
+        return false
+    end
+
+    local CHARPOS_KEY_PAT = {
+        "charpos", "char_pos", "position", "pos", "velocity",
+        "speed", "walkspeed", "movespeed", "displacement",
+    }
+
+    local function is_charpos_key(k)
+        if type(k) ~= "string" then return false end
+        local lowered = string.lower(k)
+        for _, pat in ipairs(CHARPOS_KEY_PAT) do
+            if lowered == pat or string.find(lowered, pat, 1, true) then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function clamp_value(v, depth)
+        if depth and depth > 6 then return v end
+        if typeof and typeof(v) == "Vector3" then
+            local max = conf("clamp_max_speed") or 18
+            if v.Magnitude > max then
+                return v.Unit * max
+            end
+            return v
+        elseif type(v) == "number" then
+            local max = conf("clamp_max_speed") or 18
+            if v > max * 4 then return max end
+            return v
+        elseif type(v) == "table" then
+            local out = {}
+            for k, vv in pairs(v) do
+                if is_charpos_key(k) and conf("charpos_scrub") then
+                    -- drop or zero keys that reveal our motion
+                    if typeof and typeof(vv) == "Vector3" then
+                        out[k] = Vector3.new(0, vv.Y or 0, 0)
+                    elseif type(vv) == "number" then
+                        out[k] = 0
+                    else
+                        out[k] = clamp_value(vv, (depth or 0) + 1)
+                    end
+                    STATS.charpos_scrubs = STATS.charpos_scrubs + 1
+                else
+                    out[k] = clamp_value(vv, (depth or 0) + 1)
+                end
+            end
+            return out
+        end
+        return v
+    end
+
+    local _telemetry_hook_installed = false
+
+    local function install_telemetry_clamp()
+        if _telemetry_hook_installed then return end
+        if not conf("telemetry_clamp") then return end
+
+        local hookmetamethod = rawget(getgenv and getgenv() or _G, "hookmetamethod")
+        local getnamecallmethod_fn = rawget(getgenv and getgenv() or _G, "getnamecallmethod")
+        if type(hookmetamethod) ~= "function"
+            or type(getnamecallmethod_fn) ~= "function" then
+            L:warn("telemetry_clamp: executor lacks hookmetamethod/getnamecallmethod; skipping")
+            return
+        end
+        local original_namecall
+        original_namecall = hookmetamethod(game, "__namecall", function(self, ...)
+            local method = getnamecallmethod_fn()
+            if method == "FireServer" or method == "InvokeServer" then
+                local nm = nil
+                pcall(function() nm = self.Name end)
+                if conf("enabled") and conf("telemetry_clamp") and name_matches(nm) then
+                    local args = {...}
+                    for i, v in ipairs(args) do
+                        args[i] = clamp_value(v, 0)
+                    end
+                    STATS.telemetry_blocked = STATS.telemetry_blocked + 1
+                    return original_namecall(self, table.unpack(args))
+                end
+            end
+            return original_namecall(self, ...)
+        end)
+        _telemetry_hook_installed = true
+        L:info("telemetry_clamp installed via hookmetamethod")
+    end
+
+    --------------------------------------------------------------------
+    -- B. suspicion_reset
+    --------------------------------------------------------------------
+
+    local function suspicion_reset_once()
+        if not conf("suspicion_reset") then return end
+        local p = lp()
+        if not p then return end
+
+        local sp = nil
+        pcall(function() sp = p:GetAttribute("SuspicionPoints") end)
+        if type(sp) == "number" and sp > 0 then
+            pcall(function() p:SetAttribute("SuspicionPoints", 0) end)
+            STATS.suspicion_resets = STATS.suspicion_resets + 1
+        end
+
+        local sus = nil
+        pcall(function() sus = p:GetAttribute("IsSuspicious") end)
+        if sus == true then
+            pcall(function() p:SetAttribute("IsSuspicious", false) end)
+        end
+
+        -- sometimes stored under different keys
+        for _, key in ipairs({"Suspicion", "Sus", "SuspicionScore", "Flagged"}) do
+            local v = nil
+            pcall(function() v = p:GetAttribute(key) end)
+            if type(v) == "number" and v > 0 then
+                pcall(function() p:SetAttribute(key, 0) end)
+            elseif v == true then
+                pcall(function() p:SetAttribute(key, false) end)
+            end
+        end
+    end
+
+    --------------------------------------------------------------------
+    -- D. warning_auto_off
+    --
+    -- Subscribe to ShadowBanEvent / RagdollEvent. If either fires on
+    -- us while bypass is active, flip enabled=false immediately.
+    --------------------------------------------------------------------
+
+    local _warning_connected = false
+
+    local function install_warning_autooff()
+        if _warning_connected then return end
+        if not conf("warning_auto_off") then return end
+        local rs = env.ReplicatedStorage
+        if not rs then return end
+        local remotes = rs:FindFirstChild("Remotes")
+        if not remotes then return end
+        local function wire(name)
+            local r = remotes:FindFirstChild(name)
+            if not r then return end
+            if pcall(function() return r.OnClientEvent end) then
+                r.OnClientEvent:Connect(function()
+                    if not conf("enabled") then return end
+                    L:warn("%s fired; auto-disabling speed bypass", name)
+                    CFG.enabled = false
+                    STATS.warning_auto_offs = STATS.warning_auto_offs + 1
+                end)
+            end
+        end
+        wire("ShadowBanEvent")
+        wire("RagdollEvent")
+        _warning_connected = true
+    end
+
+    --------------------------------------------------------------------
+    -- Technique: velocity_step
+    --------------------------------------------------------------------
+
+    local function velocity_step_tick()
+        if not conf("enabled") or not conf("velocity_step") then return end
+        local h = hum()
+        local r = root()
+        if not h or not r then return end
+        if h.WalkSpeed ~= 16 then
+            safe(function() h.WalkSpeed = 16 end)
+        end
+        local md = move_dir()
+        if md.Magnitude < 0.05 then return end
+        local sp = conf("walkspeed") or 16
+        local existing_v = r.AssemblyLinearVelocity
+        pcall(function()
+            r.AssemblyLinearVelocity = Vector3.new(md.X * sp, existing_v.Y, md.Z * sp)
+        end)
+        STATS.velocity_steps = STATS.velocity_steps + 1
+    end
+
+    --------------------------------------------------------------------
+    -- Technique: cframe_pulse
+    --------------------------------------------------------------------
+
+    local PULSE = {t = 0, fast = true}
+
+    local function cframe_pulse_tick(dt)
+        if not conf("enabled") or not conf("cframe_pulse") then return end
+        PULSE.t = PULSE.t + dt
+        local h = hum()
+        if not h then return end
+        if PULSE.fast then
+            safe(function() h.WalkSpeed = conf("pulse_fast_speed") or 40 end)
+            if PULSE.t >= (conf("pulse_fast_seconds") or 0.15) then
+                PULSE.t = 0; PULSE.fast = false
+            end
+        else
+            safe(function() h.WalkSpeed = conf("pulse_slow_speed") or 16 end)
+            if PULSE.t >= (conf("pulse_slow_seconds") or 0.35) then
+                PULSE.t = 0; PULSE.fast = true
+            end
+        end
+    end
+
+    --------------------------------------------------------------------
+    -- Technique: platform_stand + LinearVelocity
+    --------------------------------------------------------------------
+
+    local function platform_on()
+        local h = hum(); local r = root()
+        if not h or not r then return end
+        safe(function() h.PlatformStand = true end)
+        if not r:FindFirstChild("_grg_sb_lv") then
+            local att = Instance.new("Attachment")
+            att.Name = "_grg_sb_lv_att"
+            att.Parent = r
+            local lv = Instance.new("LinearVelocity")
+            lv.Name = "_grg_sb_lv"
+            lv.Attachment0 = att
+            lv.MaxForce = math.huge
+            lv.VectorVelocity = Vector3.new(0, 0, 0)
+            lv.RelativeTo = Enum.ActuatorRelativeTo.World
+            lv.Parent = r
+        end
+    end
+
+    local function platform_off()
+        local h = hum(); local r = root()
+        if h then safe(function() h.PlatformStand = false end) end
+        if r then
+            local lv = r:FindFirstChild("_grg_sb_lv")
+            if lv then pcall(function() lv:Destroy() end) end
+            local att = r:FindFirstChild("_grg_sb_lv_att")
+            if att then pcall(function() att:Destroy() end) end
+        end
+    end
+
+    local function platform_tick()
+        if not conf("enabled") or not conf("platform_stand") then
+            return platform_off()
+        end
+        platform_on()
+        local r = root()
+        if not r then return end
+        local lv = r:FindFirstChild("_grg_sb_lv")
+        if not lv then return end
+        local md = move_dir()
+        local sp = conf("walkspeed") or 16
+        if md.Magnitude > 0 then
+            pcall(function()
+                lv.VectorVelocity = Vector3.new(md.X * sp, 0, md.Z * sp)
+            end)
+        else
+            pcall(function() lv.VectorVelocity = Vector3.new(0, 0, 0) end)
+        end
+    end
+
+    --------------------------------------------------------------------
+    -- Technique: seat_clone
+    --------------------------------------------------------------------
+
+    local SEAT = {part = nil, weld = nil}
+
+    local function seat_spawn()
+        if SEAT.part and SEAT.part.Parent then return SEAT.part end
+        local h = hum(); local r = root()
+        if not h or not r or not env.Workspace then return nil end
+        local seat = Instance.new("VehicleSeat")
+        seat.Name = "_grg_sb_seat"
+        seat.Size = Vector3.new(1, 0.1, 1)
+        seat.Transparency = 1
+        seat.CanCollide = false
+        seat.HeadsUpDisplay = false
+        seat.Anchored = false
+        seat.MaxSpeed = conf("walkspeed")
+        seat.Torque = 10
+        seat.TurnSpeed = 2
+        seat.CFrame = r.CFrame
+        seat.Parent = env.Workspace
+
+        local weld = Instance.new("Weld")
+        weld.Part0 = r
+        weld.Part1 = seat
+        weld.C0 = CFrame.new(0, -3, 0)
+        weld.Parent = r
+
+        pcall(function() seat:Sit(h) end)
+        SEAT.part = seat
+        SEAT.weld = weld
+        STATS.seats_spawned = STATS.seats_spawned + 1
+        L:info("seat_clone spawned (max=%s)", tostring(seat.MaxSpeed))
+        return seat
+    end
+
+    local function seat_despawn()
+        if SEAT.weld then pcall(function() SEAT.weld:Destroy() end) end
+        if SEAT.part then
+            local h = hum()
+            if h and h.SeatPart == SEAT.part then
+                pcall(function() h.Sit = false end)
+            end
+            pcall(function() SEAT.part:Destroy() end)
+        end
+        SEAT.weld = nil
+        SEAT.part = nil
+    end
+
+    local function seat_tick()
+        if not conf("enabled") or not conf("seat_clone") then
+            return seat_despawn()
+        end
+        local s = SEAT.part
+        if not s or not s.Parent then s = seat_spawn() end
+        if s then
+            pcall(function() s.MaxSpeed = conf("walkspeed") end)
+        end
+    end
+
+    --------------------------------------------------------------------
+    -- Technique: state_swap
+    --------------------------------------------------------------------
+
+    local STATE_ORIG = {}
+
+    local function state_swap_on()
+        local h = hum()
+        if not h then return end
+        local to_disable = {
+            Enum.HumanoidStateType.Running,
+            Enum.HumanoidStateType.RunningNoPhysics,
+        }
+        for _, st in ipairs(to_disable) do
+            if STATE_ORIG[st] == nil then
+                local ok, was = pcall(function() return h:GetStateEnabled(st) end)
+                if ok then STATE_ORIG[st] = was end
+            end
+            pcall(function() h:SetStateEnabled(st, false) end)
+        end
+    end
+
+    local function state_swap_off()
+        local h = hum()
+        if not h then return end
+        for st, was in pairs(STATE_ORIG) do
+            pcall(function() h:SetStateEnabled(st, was) end)
+        end
+        STATE_ORIG = {}
+    end
+
+    local function state_swap_tick()
+        if not conf("enabled") or not conf("state_swap") then
+            return state_swap_off()
+        end
+        state_swap_on()
+    end
+
+    --------------------------------------------------------------------
+    -- Heartbeat driver
+    --------------------------------------------------------------------
+
+    local _hb_conn = nil
+    local _sus_accum = 0
+
+    local function heartbeat(dt)
+        if not conf("enabled") then return end
+        STATS.ticks = STATS.ticks + 1
+
+        safe(velocity_step_tick)
+        safe(function() cframe_pulse_tick(dt) end)
+        safe(platform_tick)
+        safe(state_swap_tick)
+        safe(seat_tick)
+
+        _sus_accum = _sus_accum + dt
+        local hz = conf("suspicion_reset_hz") or 4
+        if _sus_accum >= (1 / math.max(0.5, hz)) then
+            _sus_accum = 0
+            safe(suspicion_reset_once)
+        end
+    end
+
+    local _char_conn = nil
+
+    local function on_new_character()
+        if not conf("enabled") then return end
+        task.wait(0.3)
+        platform_off()
+        seat_despawn()
+        state_swap_off()
+        STATE_ORIG = {}
+        heartbeat(0)
+    end
+
+    --------------------------------------------------------------------
+    -- Public API (exposed via _G.GRG_SB)
+    --------------------------------------------------------------------
+
+    function M.set(on)
+        CFG.enabled = on and true or false
+        if CFG.enabled then
+            L:info("enabled")
+        else
+            L:info("disabled")
+            platform_off(); seat_despawn(); state_swap_off()
+            STATE_ORIG = {}
+        end
+    end
+
+    function M.set_technique(key, on)
+        if CFG[key] == nil then
+            L:warn("unknown technique: %s", tostring(key))
+            return false
+        end
+        CFG[key] = on and true or false
+        return true
+    end
+
+    function M.configure(key, value)
+        if CFG[key] == nil then
+            L:warn("unknown config key: %s", tostring(key))
+            return false
+        end
+        CFG[key] = value
+        return true
+    end
+
+    function M.get(key) return CFG[key] end
+
+    function M.status()
+        local out = {cfg = {}, stats = {}}
+        for k, v in pairs(CFG)   do out.cfg[k]   = v end
+        for k, v in pairs(STATS) do out.stats[k] = v end
+        return out
+    end
+
+    function M.diagnostics()
+        local lines = {"speed_bypass status:"}
+        lines[#lines + 1] = ("  enabled = %s"):format(tostring(CFG.enabled))
+        lines[#lines + 1] = "  techniques:"
+        for _, k in ipairs({"velocity_step","platform_stand","seat_clone","state_swap","cframe_pulse"}) do
+            lines[#lines + 1] = ("    %-16s %s"):format(k, tostring(CFG[k]))
+        end
+        lines[#lines + 1] = "  defenses:"
+        for _, k in ipairs({"telemetry_clamp","suspicion_reset","charpos_scrub","warning_auto_off"}) do
+            lines[#lines + 1] = ("    %-16s %s"):format(k, tostring(CFG[k]))
+        end
+        lines[#lines + 1] = "  stats:"
+        for k, v in pairs(STATS) do
+            lines[#lines + 1] = ("    %-22s %s"):format(k, tostring(v))
+        end
+        return table.concat(lines, "\n")
+    end
+
+    --------------------------------------------------------------------
+    -- Install (called by init.lua)
+    --------------------------------------------------------------------
+
+    function M.install()
+        install_telemetry_clamp()
+        install_warning_autooff()
+
+        if not _hb_conn then
+            -- 30 Hz is plenty for movement; the velocity/cframe techniques
+            -- don't need 60 Hz precision and pulling to half rate halves
+            -- our per-frame cost when speed is OFF (early-return path).
+            _hb_conn = sched.register(heartbeat, 30, "grg/speed_bypass")
+        end
+
+        if env.LocalPlayer and not _char_conn then
+            _char_conn = env.LocalPlayer.CharacterAdded:Connect(function()
+                safe(on_new_character)
+            end)
+        end
+
+        -- Expose API globally for the main hub UI
+        rawset(_G, "GRG_SB", M)
+
+        state:counter("grg_sb_installed", 1)
+        L:info("speed_bypass online (protection layers always on when enabled)")
     end
 
     return M
@@ -5720,12 +6561,14 @@ __MODULES__['init'] = function(require)
 
 return function(require)
 
-    local env     = require("core/env")
-    local log     = require("core/log")
-    local cfg     = require("core/config")
-    local state   = require("core/state")
-    local caps    = require("core/executor_caps")
-    local version = require("core/version")
+    local env       = require("core/env")
+    local log       = require("core/log")
+    local cfg       = require("core/config")
+    local state     = require("core/state")
+    local caps      = require("core/executor_caps")
+    local version   = require("core/version")
+    local scheduler = require("core/scheduler")
+    scheduler.install()
 
     local L = log.scoped("init")
 
@@ -5770,6 +6613,7 @@ return function(require)
         "grg/shadowban_handler", "grg/ragdoll_handler",
         "grg/profile_spoof", "grg/raptor_alibi",
         "grg/placeid_gate", "grg/cmdr_silencer",
+        "grg/speed_bypass",
 
         -- sandbox
         "sandbox/env_shuffle", "sandbox/traceback_rewrite",
@@ -5943,6 +6787,7 @@ return function(require)
     local log   = require("core/log")
     local cfg   = require("core/config")
     local state = require("core/state")
+    local sched = require("core/scheduler")
 
     local namecall = require("hooks/namecall")
     local newindex = require("hooks/newindex")
@@ -6090,24 +6935,14 @@ return function(require)
     ----------------------------------------------------------------
 
     local function start_loop()
-        if not env.RunService then
-            L:warn("RunService missing; can't poll")
+        local hz = cfg:get("integrity.hook_persistence.poll_hz", 1)
+        if hz <= 0 then
+            L:info("poll_hz<=0; persistence check disabled")
             return
         end
-
-        local acc = 0
-        CONN = env.RunService.Heartbeat:Connect(function(dt)
-            acc = acc + dt
-            local hz = cfg:get("integrity.hook_persistence.poll_hz", 1)
-            if hz <= 0 then return end
-            local period = 1 / hz
-            if acc < period then return end
-            acc = 0
-            local ok, err = pcall(M.check_now)
-            if not ok then
-                L:warn("check_now crashed: %s", tostring(err))
-            end
-        end)
+        CONN = sched.register(function()
+            pcall(M.check_now)
+        end, hz, "integrity/hook_persistence")
     end
 
     local function stop_loop()
@@ -8622,6 +9457,7 @@ return function(require)
     local log    = require("core/log")
     local cfg    = require("core/config")
     local state  = require("core/state")
+    local sched  = require("core/scheduler")
 
     local namecall = require("hooks/namecall")
     local newindex = require("hooks/newindex")
@@ -8703,15 +9539,7 @@ return function(require)
 
     local function start_heartbeat()
         if HEARTBEAT_CN then return end
-        if not env.RunService then return end
-        local ok, cn = pcall(function()
-            return env.RunService.Heartbeat:Connect(on_heartbeat)
-        end)
-        if ok and cn then
-            HEARTBEAT_CN = cn
-        else
-            L:warn("failed to connect Heartbeat")
-        end
+        HEARTBEAT_CN = sched.register(on_heartbeat, 10, "masks/character_state")
     end
 
     ----------------------------------------------------------------
@@ -9250,6 +10078,7 @@ return function(require)
     local log    = require("core/log")
     local cfg    = require("core/config")
     local state  = require("core/state")
+    local sched  = require("core/scheduler")
 
     local index = require("hooks/index")
 
@@ -9385,16 +10214,8 @@ return function(require)
 
     local function start_heartbeat()
         if HEARTBEAT_CN then return end
-        if not env.RunService then return end
-        local ok, cn = pcall(function()
-            return env.RunService.Heartbeat:Connect(on_heartbeat)
-        end)
-        if ok and cn then
-            HEARTBEAT_CN = cn
-            LAST_TICK = tick()
-        else
-            L:warn("failed to connect Heartbeat")
-        end
+        HEARTBEAT_CN = sched.register(on_heartbeat, 20, "masks/position")
+        LAST_TICK = tick()
     end
 
     ----------------------------------------------------------------
@@ -11213,6 +12034,7 @@ return function(require)
     local log      = require("core/log")
     local cfg      = require("core/config")
     local state    = require("core/state")
+    local sched    = require("core/scheduler")
     local namecall = require("hooks/namecall")
 
     local M = {}
@@ -11357,12 +12179,9 @@ return function(require)
         hook_setcore()
         hook_soundservice()
 
-        if env.RunService then
-            env.RunService.Heartbeat:Connect(function(dt)
-                local ok, err = pcall(on_heartbeat, dt)
-                if not ok then L:warn("sweep err: %s", tostring(err)) end
-            end)
-        end
+        -- CoreGui warning sweeps at 4 Hz; the warning dialogs stay up
+        -- for seconds so 250ms granularity is plenty.
+        sched.register(on_heartbeat, 4, "scrubbers/coregui_warning")
 
         L:info("coregui_warning scrubber active")
     end
@@ -11667,6 +12486,7 @@ return function(require)
     local log      = require("core/log")
     local cfg      = require("core/config")
     local state    = require("core/state")
+    local sched    = require("core/scheduler")
     local recv     = require("hooks/recv_handlers")
 
     local M = {}
@@ -11793,28 +12613,19 @@ return function(require)
             env.LocalPlayer.CharacterAdded:Connect(on_char_added)
         end
 
-        -- Heartbeat sweep -----------------------------------------
-        if env.RunService then
-            env.RunService.Heartbeat:Connect(function(dt)
-                SWEEP_TIMER = SWEEP_TIMER + (dt or 0)
-                if SWEEP_TIMER < 0.5 then return end
-                SWEEP_TIMER = 0
-
-                track_safe_position()
-
-                if not cfg:get("scrubbers.ragdoll.restore_hrp", true) then
-                    return
-                end
-                local char = env.get_character()
-                if not char then return end
-                local n = destroy_ragdoll_joints(char)
-                if n > 0 then
-                    L:warn("restored char: cleared %d ragdoll joints", n)
-                    local hum = char:FindFirstChildOfClass("Humanoid")
-                    force_humanoid_safe(hum)
-                end
-            end)
-        end
+        -- Ragdoll sweep at 2 Hz via shared scheduler.
+        sched.register(function()
+            track_safe_position()
+            if not cfg:get("scrubbers.ragdoll.restore_hrp", true) then return end
+            local char = env.get_character()
+            if not char then return end
+            local n = destroy_ragdoll_joints(char)
+            if n > 0 then
+                L:warn("restored char: cleared %d ragdoll joints", n)
+                local hum = char:FindFirstChildOfClass("Humanoid")
+                force_humanoid_safe(hum)
+            end
+        end, 2, "scrubbers/ragdoll")
 
         L:info("ragdoll scrubber active (quota=%s, restore_hrp=%s)",
             tostring(cfg:get("scrubbers.ragdoll.max_ragdolls_per_min", 0)),
@@ -11889,6 +12700,7 @@ return function(require)
     local log      = require("core/log")
     local cfg      = require("core/config")
     local state    = require("core/state")
+    local sched    = require("core/scheduler")
     local recv     = require("hooks/recv_handlers")
 
     local M = {}
@@ -12012,15 +12824,9 @@ return function(require)
             end,
         })
 
-        -- Periodic GUI sweep -- heartbeat counter.
-        if env.RunService then
-            env.RunService.Heartbeat:Connect(function(dt)
-                local ok, err = pcall(on_heartbeat, dt)
-                if not ok then
-                    L:warn("heartbeat sweep errored: %s", tostring(err))
-                end
-            end)
-        end
+        -- Periodic GUI sweep at 4 Hz (shadowban overlay GUIs stay up
+        -- for seconds; no need to sweep every frame).
+        sched.register(on_heartbeat, 4, "scrubbers/shadowban")
 
         L:info("shadowban scrubber active (overlay_sweep=%s)",
             tostring(cfg:get("scrubbers.shadowban.block_visual_overlay", true)))
@@ -12538,6 +13344,7 @@ return function(require)
     local log      = require("core/log")
     local cfg      = require("core/config")
     local state    = require("core/state")
+    local sched    = require("core/scheduler")
     local namecall = require("hooks/namecall")
 
     local M = {}
@@ -12628,21 +13435,12 @@ return function(require)
         end
     end
 
-    local HB_COUNTER = 0
-
     local function start_scanner()
-        local rs = env.RunService
-        if not rs then return end
-        rs.Heartbeat:Connect(function(dt)
-            if not cfg:get("silencers.gui_warning_block.enabled", true) then
-                return
-            end
-            HB_COUNTER = HB_COUNTER + dt
-            if HB_COUNTER < 1 then return end
-            HB_COUNTER = 0
+        sched.register(function()
+            if not cfg:get("silencers.gui_warning_block.enabled", true) then return end
             pcall(scan_container, env.PlayerGui)
             pcall(scan_container, env.CoreGui)
-        end)
+        end, 1, "silencers/gui_warning_block")
     end
 
     local function install_notification_hook()
@@ -13393,6 +14191,7 @@ return function(require)
     local log   = require("core/log")
     local cfg   = require("core/config")
     local state = require("core/state")
+    local sched = require("core/scheduler")
 
     local M = {}
     local L = log.scoped("spoof/fingerprint_cleaner")
@@ -13687,26 +14486,11 @@ return function(require)
     local INTERVAL = 5.0  -- seconds between periodic re-wipes
 
     local function start_loop()
-        if not env.RunService then
-            L:warn("RunService unavailable; periodic re-wipe disabled")
-            return
-        end
-
-        local accum = 0
-        env.RunService.Heartbeat:Connect(function(dt)
-            accum = accum + dt
-            if accum < INTERVAL then return end
-            accum = 0
+        sched.register(function()
             if not cfg:get("spoof.fingerprint_cleaner.enabled", true) then return end
-            -- If every bucket is off we still run, because extras
-            -- may need clearing. do_pass itself no-ops when no
-            -- targets match.
             _G.__GRG_THREAD = _G.__GRG_THREAD or true
-            local ok, err = pcall(do_pass)
-            if not ok then
-                L:warn("periodic pass errored: %s", tostring(err))
-            end
-        end)
+            pcall(do_pass)
+        end, 1 / INTERVAL, "spoof/fingerprint_cleaner")
     end
 
     function M.install()
@@ -15086,6 +15870,7 @@ return function(require)
     local log   = require("core/log")
     local cfg   = require("core/config")
     local state = require("core/state")
+    local sched = require("core/scheduler")
 
     local M = {}
     local L = log.scoped("timing/tick_smoother")
@@ -15163,14 +15948,10 @@ return function(require)
 
     local function start_feed()
         if GLOBAL_CONN then return end
-        if not env.RunService then
-            L:warn("no RunService; global feed cannot start")
-            return
-        end
         local g = M.global()
-        GLOBAL_CONN = env.RunService.Heartbeat:Connect(function(dt)
-            g:update(dt)
-        end)
+        -- 20 Hz is enough for an EWMA smoother; the frame-rate the
+        -- smoother reports isn't meant to be a precision instrument.
+        GLOBAL_CONN = sched.register(function(dt) g:update(dt) end, 20, "timing/tick_smoother")
         L:info("tick smoother started (alpha=%.3f)", g.alpha)
     end
 
@@ -15252,6 +16033,7 @@ return function(require)
     local log   = require("core/log")
     local cfg   = require("core/config")
     local state = require("core/state")
+    local sched = require("core/scheduler")
 
     local self_protect = require("integrity/self_protect")
 
@@ -15599,15 +16381,12 @@ return function(require)
 
     local function start_heartbeat()
         if HB_CONN then return end
-        if not env.RunService then return end
-        HB_CONN = env.RunService.Heartbeat:Connect(function()
-            local t = tick()
-            if t - LAST_DRAW < 0.1 then return end  -- ~10 Hz
-            LAST_DRAW = t
+        HB_CONN = sched.register(function()
+            LAST_DRAW = tick()
             if GUI and GUI.Parent and not MINIMIZED then
                 redraw_counters()
             end
-        end)
+        end, 10, "ui/status_panel")
     end
 
     local function stop_heartbeat()
