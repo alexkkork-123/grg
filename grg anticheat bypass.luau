@@ -2,7 +2,7 @@
 -- GRG ANTI-CHEAT BYPASS -- compiled bundle
 -- Built by: grg/anticheat/tools/compile_acbypass.py
 -- Modules : 76
--- Bytes   : 524882
+-- Bytes   : 524335
 -- ---------------------------------------------------------------------------
 
 local __MODULES__ = {}
@@ -1678,17 +1678,6 @@ return function(require)
     M.BUILD    = "20260425"
     M.STRING   = string.format("%d.%d.%d-%s+%s", M.MAJOR, M.MINOR, M.PATCH, M.CODENAME, M.BUILD)
 
-    M.BANNER = [[
-   _____ _____   _____    /\   _____   ____  __     ___  ___ ____
-  / ____|  __ \ / ____|  /\ \ / ____| / __ \|  \  / /__ \|__ \  __|
- | |  __| |__) | |  __  /  \ \ |    /| |  | | |\ \/ /__) |  ) | |__
- | | |_ |  _  /| | |_ | / /\ \ \   |_| |  | | | \  /|__ <  / /|___ |
- | |__| | | \ \| |__| |/ ____ \ \  __| |__| | |  \/ ___) |/ /_____ |
-  \_____|_|  \_\\_____|/_/    \_\\____\\____/|_|     |____/|______|
-
-           GRG anti-cheat bypass  --  v]] .. nil
-
-    -- Concatenating after a nil would error; build banner in pieces.
     M.BANNER = [[
    ____ ____ ____    ___ ____  __  __ ____  __ ____ ____ ____
   / ___|  _ \/ ___|  / _ \  _ \|  |/  \  _ \|  |  _ \_   _/ ___|
